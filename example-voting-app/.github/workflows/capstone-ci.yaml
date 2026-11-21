@@ -1,0 +1,169 @@
+name: Capstone CI
+
+on:
+  push:
+    branches:
+      - "**"
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  COMPOSE_PROJECT_NAME: capstone-ci
+  POSTGRES_USER: postgres
+  POSTGRES_DB: postgres
+
+jobs:
+  build-test-scan-push:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Generate temporary test database password
+        shell: bash
+        run: |
+          password="$(openssl rand -hex 24)"
+          echo "::add-mask::$password"
+          printf 'POSTGRES_PASSWORD=%s\n' "$password" >> "$GITHUB_ENV"
+
+      - name: Validate Compose configuration
+        run: docker compose config --quiet
+
+      - name: Build and start application
+        run: |
+          docker compose up --build --detach \
+            --wait --wait-timeout 180 \
+            vote result worker redis db
+
+      - name: Run voting smoke tests
+        run: bash scripts/smoke-test.sh
+
+      - name: Tag tested images with commit SHA
+        id: images
+        shell: bash
+        run: |
+          prefix="ghcr.io/${GITHUB_REPOSITORY,,}"
+          printf 'prefix=%s\n' "$prefix" >> "$GITHUB_OUTPUT"
+
+          for service in vote result worker; do
+            docker tag \
+              "capstone-ci-$service" \
+              "$prefix-$service:$GITHUB_SHA"
+          done
+
+      - name: Install Trivy
+        uses: aquasecurity/setup-trivy@3fb12ec12f41e471780db15c232d5dd185dcb514
+        with:
+          version: v0.70.0
+
+      - name: Report all HIGH and CRITICAL findings
+        shell: bash
+        env:
+          IMAGE_PREFIX: ${{ steps.images.outputs.prefix }}
+        run: |
+          for service in vote result worker; do
+            echo "Scanning $service: includes unfixed findings"
+            trivy image \
+              --scanners vuln \
+              --severity HIGH,CRITICAL \
+              --ignore-unfixed=false \
+              --exit-code 0 \
+              "$IMAGE_PREFIX-$service:$GITHUB_SHA"
+          done
+
+      - name: Block fixable HIGH and CRITICAL findings
+        shell: bash
+        env:
+          IMAGE_PREFIX: ${{ steps.images.outputs.prefix }}
+        run: |
+          failed=0
+
+          for service in vote result worker; do
+            echo "Checking fixable findings in $service"
+            trivy image \
+              --scanners vuln \
+              --severity HIGH,CRITICAL \
+              --ignore-unfixed \
+              --exit-code 1 \
+              "$IMAGE_PREFIX-$service:$GITHUB_SHA" || failed=1
+          done
+
+          exit "$failed"
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push scanned images
+        shell: bash
+        env:
+          IMAGE_PREFIX: ${{ steps.images.outputs.prefix }}
+        run: |
+          for service in vote result worker; do
+            docker push "$IMAGE_PREFIX-$service:$GITHUB_SHA"
+          done
+
+      - name: Show application logs on failure
+        if: failure()
+        run: docker compose logs --no-color --tail=100
+
+      - name: Remove temporary test containers and volumes
+        if: always()
+        run: docker compose down --volumes --remove-orphans
+
+  deploy:
+    name: Deploy voting app
+    needs: build-test-scan-push
+    if: >-
+      github.repository == 'chiedozief35-cloud/example-voting-app' &&
+      (github.ref == 'refs/heads/capstone/helm' ||
+       github.ref == 'refs/heads/main')
+    runs-on: [self-hosted, linux, x64, capstone-deploy]
+    timeout-minutes: 15
+
+    permissions:
+      contents: read
+
+    concurrency:
+      group: voting-deployment
+      cancel-in-progress: false
+
+    env:
+      KUBECONFIG: /home/ubuntu/.kube/capstone.yaml
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Validate Helm chart
+        run: helm lint charts/voting-app
+
+      - name: Deploy images from this commit
+        shell: bash
+        run: |
+          helm upgrade --install voting charts/voting-app \
+            --namespace voting \
+            --values charts/voting-app/values.yaml \
+            --set-string imageTag="$GITHUB_SHA" \
+            --wait \
+            --timeout 10m
+
+      - name: Show deployed release
+        run: helm list --namespace voting
+
+      - name: Show diagnostics on failure
+        if: failure()
+        run: |
+          helm history voting --namespace voting
+          kubectl get pods --namespace voting
+          kubectl get events --namespace voting \
+            --sort-by=.metadata.creationTimestamp

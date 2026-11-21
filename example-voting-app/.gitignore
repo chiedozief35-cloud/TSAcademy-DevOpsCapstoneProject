@@ -1,0 +1,22 @@
+*.pyc
+project.lock.json
+bin/
+obj/
+.vs/
+node_modules/
+
+# Local environment settings
+.env
+.env.*
+!.env.example
+
+# Terraform local files and state
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+terraform/*.tfvars
+terraform/*.tfvars.json
+!terraform/terraform.tfvars.example

@@ -1,0 +1,10 @@
+uwsgi
+Flask
+requests
+pika
+prometheus_client
+opentracing
+opentelemetry-sdk==1.34.1
+opentelemetry-exporter-otlp-proto-http==1.34.1
+opentelemetry-instrumentation-flask==0.55b1
+opentelemetry-instrumentation-requests==0.55b1
